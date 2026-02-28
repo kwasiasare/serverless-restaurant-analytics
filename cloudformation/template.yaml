@@ -1,0 +1,584 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Serverless Restaurant Analytics Platform — ingests clickstream events via API Gateway
+  and Lambda, streams them through Kinesis Data Firehose to S3, catalogs with Glue,
+  and queries with Athena.
+
+# =============================================================================
+# Parameters
+# =============================================================================
+Parameters:
+  ProjectName:
+    Type: String
+    Default: restaurant_analytics
+    Description: Prefix applied to every resource name for namespacing.
+
+  GlueCrawlerSchedule:
+    Type: String
+    Default: "cron(0 * * * ? *)"
+    Description: Cron schedule for the Glue Crawler (default is hourly).
+
+# =============================================================================
+# Resources
+# =============================================================================
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # 1. S3 Buckets
+  # ---------------------------------------------------------------------------
+
+  RawDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-raw-data-${AWS::AccountId}"
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIntelligentTiering
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: INTELLIGENT_TIERING
+
+  AthenaResultsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-athena-results-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # ---------------------------------------------------------------------------
+  # 2. IAM Roles
+  # ---------------------------------------------------------------------------
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-lambda-execution-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: !Sub "${ProjectName}-lambda-inline-policy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: FirehoseAccess
+                Effect: Allow
+                Action:
+                  - firehose:PutRecord
+                  - firehose:PutRecordBatch
+                Resource: !GetAtt FirehoseDeliveryStream.Arn
+              - Sid: CloudWatchLogsAccess
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-ingestor:*"
+
+  FirehoseDeliveryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-firehose-delivery-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub "${ProjectName}-firehose-inline-policy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: S3Access
+                Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:PutObject
+                Resource:
+                  - !GetAtt RawDataBucket.Arn
+                  - !Sub "${RawDataBucket.Arn}/*"
+              - Sid: CloudWatchLogsAccess
+                Effect: Allow
+                Action:
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/kinesisfirehose/${ProjectName}-clickstream:*"
+
+  GlueCrawlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-glue-crawler-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: !Sub "${ProjectName}-glue-s3-inline-policy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: S3ReadAccess
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt RawDataBucket.Arn
+                  - !Sub "${RawDataBucket.Arn}/*"
+
+  # ---------------------------------------------------------------------------
+  # 3. CloudWatch Log Groups
+  # ---------------------------------------------------------------------------
+
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-ingestor"
+      RetentionInDays: 30
+
+  FirehoseLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/kinesisfirehose/${ProjectName}-clickstream"
+      RetentionInDays: 7
+
+  # API Gateway access logs — must exist before ProdStage references it.
+  ApiGatewayAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/apigateway/${ProjectName}-access-logs"
+      RetentionInDays: 14
+
+  # ---------------------------------------------------------------------------
+  # 4. Kinesis Data Firehose
+  # ---------------------------------------------------------------------------
+
+  FirehoseDeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    DependsOn:
+      - FirehoseLogGroup
+      - FirehoseDeliveryRole
+      - RawDataBucket
+    Properties:
+      DeliveryStreamName: !Sub "${ProjectName}-clickstream"
+      DeliveryStreamType: DirectPut
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !GetAtt RawDataBucket.Arn
+        RoleARN: !GetAtt FirehoseDeliveryRole.Arn
+        # Dynamic partitioning expressions require ExtendedS3DestinationConfiguration.
+        # S3DestinationConfiguration treats !{timestamp:...} as literal strings.
+        Prefix: "clickstream/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/hour=!{timestamp:HH}/"
+        ErrorOutputPrefix: "errors/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/hour=!{timestamp:HH}/!{firehose:error-output-type}/"
+        BufferingHints:
+          IntervalInSeconds: 60
+          SizeInMBs: 5
+        CompressionFormat: GZIP
+        DynamicPartitioningConfiguration:
+          Enabled: true
+        CloudWatchLoggingOptions:
+          Enabled: true
+          LogGroupName: !Sub "/aws/kinesisfirehose/${ProjectName}-clickstream"
+          LogStreamName: S3Delivery
+
+  # ---------------------------------------------------------------------------
+  # 5. Lambda Function
+  # ---------------------------------------------------------------------------
+
+  IngestorFunction:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - LambdaLogGroup
+      - LambdaExecutionRole
+      - FirehoseDeliveryStream
+    Properties:
+      FunctionName: !Sub "${ProjectName}-ingestor"
+      Runtime: python3.12
+      Handler: handler.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      MemorySize: 256
+      Timeout: 30
+      Environment:
+        Variables:
+          FIREHOSE_STREAM_NAME: !Ref FirehoseDeliveryStream
+          LOG_LEVEL: INFO
+      Code:
+        ZipFile: |
+          import json
+          def handler(event, context):
+              return {"statusCode": 200, "body": json.dumps({"message": "stub"})}
+
+  # ---------------------------------------------------------------------------
+  # 6. API Gateway
+  # ---------------------------------------------------------------------------
+
+  RestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "${ProjectName}-api"
+      Description: "Restaurant clickstream ingestion API"
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  EventsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !GetAtt RestApi.RootResourceId
+      PathPart: events
+
+  EventsPostMethod:
+    Type: AWS::ApiGateway::Method
+    DependsOn: IngestorFunction
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref EventsResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${IngestorFunction.Arn}/invocations"
+
+  LambdaApiGatewayPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt IngestorFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/POST/events"
+
+  ApiGatewayAccount:
+    Type: AWS::ApiGateway::Account
+    Properties:
+      CloudWatchRoleArn: !GetAtt ApiGatewayCloudWatchRole.Arn
+
+  ApiGatewayCloudWatchRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-apigw-cloudwatch-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+
+  ProdDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - EventsPostMethod
+      - ApiGatewayAccount
+    Properties:
+      RestApiId: !Ref RestApi
+
+  ProdStage:
+    Type: AWS::ApiGateway::Stage
+    DependsOn:
+      - ApiGatewayAccount
+      - ApiGatewayAccessLogGroup
+    Properties:
+      RestApiId: !Ref RestApi
+      DeploymentId: !Ref ProdDeployment
+      StageName: prod
+      AccessLogSetting:
+        DestinationArn: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/apigateway/${ProjectName}-access-logs"
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          LoggingLevel: INFO
+          MetricsEnabled: true
+
+  ApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    DependsOn: ProdStage
+    Properties:
+      Name: !Sub "${ProjectName}-api-key"
+      Enabled: true
+      StageKeys:
+        - RestApiId: !Ref RestApi
+          StageName: prod
+
+  UsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    DependsOn: ProdStage
+    Properties:
+      UsagePlanName: !Sub "${ProjectName}-usage-plan"
+      Throttle:
+        RateLimit: 100
+        BurstLimit: 200
+      Quota:
+        Limit: 100000
+        Period: MONTH
+      ApiStages:
+        - ApiId: !Ref RestApi
+          Stage: prod
+
+  UsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref ApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref UsagePlan
+
+  # ---------------------------------------------------------------------------
+  # 7. Glue
+  # ---------------------------------------------------------------------------
+
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub "${ProjectName}_db"
+        Description: !Sub "Glue database for ${ProjectName} clickstream data"
+
+  GlueCrawler:
+    Type: AWS::Glue::Crawler
+    DependsOn:
+      - GlueDatabase
+      - GlueCrawlerRole
+      - RawDataBucket
+    Properties:
+      Name: !Sub "${ProjectName}-crawler"
+      Role: !GetAtt GlueCrawlerRole.Arn
+      DatabaseName: !Ref GlueDatabase
+      Targets:
+        S3Targets:
+          - Path: !Sub "s3://${RawDataBucket}/clickstream/"
+      Schedule:
+        ScheduleExpression: !Ref GlueCrawlerSchedule
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+      # Only crawl new S3 prefixes on each run — avoids re-cataloguing already
+      # discovered partitions, which is expensive at hourly cadence.
+      RecrawlPolicy:
+        RecrawlBehavior: CRAWL_NEW_FOLDERS_ONLY
+      Configuration: |
+        {
+          "Version": 1.0,
+          "CrawlerOutput": {
+            "Partitions": {
+              "AddOrUpdateBehavior": "InheritFromTable"
+            }
+          }
+        }
+
+  # ---------------------------------------------------------------------------
+  # 8. Athena Workgroup
+  # ---------------------------------------------------------------------------
+
+  AthenaWorkgroup:
+    Type: AWS::Athena::WorkGroup
+    DependsOn: AthenaResultsBucket
+    Properties:
+      Name: !Sub "${ProjectName}-workgroup"
+      State: ENABLED
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: true
+        BytesScannedCutoffPerQuery: 104857600
+        ResultConfiguration:
+          OutputLocation: !Sub "s3://${AthenaResultsBucket}/"
+
+  # ---------------------------------------------------------------------------
+  # 9. CloudWatch Dashboard
+  # ---------------------------------------------------------------------------
+
+  MonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    DependsOn:
+      - IngestorFunction
+      - FirehoseDeliveryStream
+    Properties:
+      DashboardName: !Sub "${ProjectName}-dashboard"
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "title": "Lambda Invocations",
+                "view": "timeSeries",
+                "stat": "Sum",
+                "period": 300,
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${ProjectName}-ingestor"]
+                ],
+                "region": "${AWS::Region}"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 8,
+              "y": 0,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "title": "Lambda Errors",
+                "view": "timeSeries",
+                "stat": "Sum",
+                "period": 300,
+                "metrics": [
+                  ["AWS/Lambda", "Errors", "FunctionName", "${ProjectName}-ingestor"]
+                ],
+                "region": "${AWS::Region}"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 16,
+              "y": 0,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "title": "Lambda Duration (ms)",
+                "view": "timeSeries",
+                "stat": "Average",
+                "period": 300,
+                "metrics": [
+                  ["AWS/Lambda", "Duration", "FunctionName", "${ProjectName}-ingestor"]
+                ],
+                "region": "${AWS::Region}"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "title": "Firehose Incoming Records",
+                "view": "timeSeries",
+                "stat": "Sum",
+                "period": 300,
+                "metrics": [
+                  ["AWS/Firehose", "IncomingRecords", "DeliveryStreamName", "${ProjectName}-clickstream"]
+                ],
+                "region": "${AWS::Region}"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "title": "Firehose Delivery to S3 Success",
+                "view": "timeSeries",
+                "stat": "Sum",
+                "period": 300,
+                "metrics": [
+                  ["AWS/Firehose", "DeliveryToS3.Success", "DeliveryStreamName", "${ProjectName}-clickstream"]
+                ],
+                "region": "${AWS::Region}"
+              }
+            }
+          ]
+        }
+
+  # ---------------------------------------------------------------------------
+  # 10. CloudWatch Alarm
+  # ---------------------------------------------------------------------------
+
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    DependsOn: IngestorFunction
+    Properties:
+      AlarmName: !Sub "${ProjectName}-lambda-errors"
+      AlarmDescription: !Sub "Alarm when ${ProjectName}-ingestor Lambda errors reach or exceed 10 in a 5-minute window."
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref IngestorFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 10
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+# =============================================================================
+# Outputs
+# =============================================================================
+Outputs:
+  ApiEndpoint:
+    Description: "HTTPS endpoint for posting clickstream events"
+    Value: !Sub "https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/prod/events"
+    Export:
+      Name: !Sub "${ProjectName}-ApiEndpoint"
+
+  ApiKeyId:
+    Description: "API Key ID — retrieve the value with: aws apigateway get-api-key --api-key <id> --include-value"
+    Value: !Ref ApiKey
+    Export:
+      Name: !Sub "${ProjectName}-ApiKeyId"
+
+  RawDataBucketName:
+    Description: "S3 bucket where raw clickstream data is stored"
+    Value: !Ref RawDataBucket
+    Export:
+      Name: !Sub "${ProjectName}-RawDataBucket"
+
+  AthenaResultsBucketName:
+    Description: "S3 bucket for Athena query results"
+    Value: !Ref AthenaResultsBucket
+    Export:
+      Name: !Sub "${ProjectName}-AthenaResultsBucket"
+
+  FirehoseStreamName:
+    Description: "Kinesis Data Firehose delivery stream name"
+    Value: !Ref FirehoseDeliveryStream
+    Export:
+      Name: !Sub "${ProjectName}-FirehoseStream"
+
+  GlueDatabaseName:
+    Description: "Glue Data Catalog database name"
+    Value: !Ref GlueDatabase
+    Export:
+      Name: !Sub "${ProjectName}-GlueDatabase"
+
+  AthenaWorkgroupName:
+    Description: "Athena workgroup name"
+    Value: !Ref AthenaWorkgroup
+    Export:
+      Name: !Sub "${ProjectName}-AthenaWorkgroup"
