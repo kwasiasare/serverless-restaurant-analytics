@@ -10,8 +10,17 @@ Description: >
 Parameters:
   ProjectName:
     Type: String
-    Default: restaurant_analytics
-    Description: Prefix applied to every resource name for namespacing.
+    Default: restaurant-analytics
+    Description: >
+      Prefix applied to every resource name for namespacing.
+      Use only lowercase letters and hyphens (S3 bucket name constraint).
+
+  GlueDatabaseName:
+    Type: String
+    Default: restaurant_analytics_db
+    Description: >
+      Glue Data Catalog database name. Must use underscores, not hyphens,
+      to avoid backtick-quoting requirements in Athena SQL queries.
 
   GlueCrawlerSchedule:
     Type: String
@@ -200,8 +209,6 @@ Resources:
           IntervalInSeconds: 60
           SizeInMBs: 5
         CompressionFormat: GZIP
-        DynamicPartitioningConfiguration:
-          Enabled: true
         CloudWatchLoggingOptions:
           Enabled: true
           LogGroupName: !Sub "/aws/kinesisfirehose/${ProjectName}-clickstream"
@@ -361,7 +368,7 @@ Resources:
     Properties:
       CatalogId: !Ref AWS::AccountId
       DatabaseInput:
-        Name: !Sub "${ProjectName}_db"
+        Name: !Ref GlueDatabaseName
         Description: !Sub "Glue database for ${ProjectName} clickstream data"
 
   GlueCrawler:
@@ -380,7 +387,7 @@ Resources:
       Schedule:
         ScheduleExpression: !Ref GlueCrawlerSchedule
       SchemaChangePolicy:
-        UpdateBehavior: UPDATE_IN_DATABASE
+        UpdateBehavior: LOG
         DeleteBehavior: LOG
       # Only crawl new S3 prefixes on each run — avoids re-cataloguing already
       # discovered partitions, which is expensive at hourly cadence.
@@ -544,41 +551,27 @@ Outputs:
   ApiEndpoint:
     Description: "HTTPS endpoint for posting clickstream events"
     Value: !Sub "https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/prod/events"
-    Export:
-      Name: !Sub "${ProjectName}-ApiEndpoint"
 
   ApiKeyId:
     Description: "API Key ID — retrieve the value with: aws apigateway get-api-key --api-key <id> --include-value"
     Value: !Ref ApiKey
-    Export:
-      Name: !Sub "${ProjectName}-ApiKeyId"
 
   RawDataBucketName:
     Description: "S3 bucket where raw clickstream data is stored"
     Value: !Ref RawDataBucket
-    Export:
-      Name: !Sub "${ProjectName}-RawDataBucket"
 
   AthenaResultsBucketName:
     Description: "S3 bucket for Athena query results"
     Value: !Ref AthenaResultsBucket
-    Export:
-      Name: !Sub "${ProjectName}-AthenaResultsBucket"
 
   FirehoseStreamName:
     Description: "Kinesis Data Firehose delivery stream name"
     Value: !Ref FirehoseDeliveryStream
-    Export:
-      Name: !Sub "${ProjectName}-FirehoseStream"
 
   GlueDatabaseName:
     Description: "Glue Data Catalog database name"
     Value: !Ref GlueDatabase
-    Export:
-      Name: !Sub "${ProjectName}-GlueDatabase"
 
   AthenaWorkgroupName:
     Description: "Athena workgroup name"
     Value: !Ref AthenaWorkgroup
-    Export:
-      Name: !Sub "${ProjectName}-AthenaWorkgroup"

@@ -180,7 +180,7 @@ BlockPublicPolicy=true,RestrictPublicBuckets=true
     fi
 
     # Zip the handler and upload
-    TMP_ZIP=$(mktemp /tmp/lambda-handler-XXXXXX.zip)
+    TMP_ZIP=$(mktemp /tmp/lambda-handler-XXXXXX).zip
     info "Zipping handler to: $TMP_ZIP"
     (cd "$(dirname "$LAMBDA_HANDLER")" && zip -q "$TMP_ZIP" handler.py)
 
@@ -208,7 +208,7 @@ DEPLOY_ARGS=(
     cloudformation deploy
     --template-file "$TEMPLATE_FILE"
     --stack-name    "$STACK_NAME"
-    --parameter-overrides "ProjectName=${STACK_NAME//-/_}"
+    --parameter-overrides "ProjectName=$STACK_NAME" "GlueDatabaseName=${STACK_NAME//-/_}_db"
     --capabilities  CAPABILITY_NAMED_IAM
     --region        "$REGION"
     --no-fail-on-empty-changeset
