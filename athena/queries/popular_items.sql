@@ -62,14 +62,17 @@ raw_events AS (
         price
     FROM YOUR_DATABASE.clickstream
     WHERE
-        -- Coarse partition pruning (pushed to partition index):
-        year  IN (YEAR(CURRENT_DATE), YEAR(date_add('day', -6, CURRENT_DATE)))
-        AND month IN (MONTH(CURRENT_DATE), MONTH(date_add('day', -6, CURRENT_DATE)))
+        -- Coarse partition pruning: compare VARCHAR partition columns to VARCHAR
+        -- constants. Glue Crawler stores Hive partition values as strings
+        -- (e.g. month='03'), so YEAR()/MONTH() bigint return types must be
+        -- cast and zero-padded to match the stored folder names.
+        year  IN (CAST(YEAR(CURRENT_DATE) AS VARCHAR),
+                  CAST(YEAR(date_add('day', -6, CURRENT_DATE)) AS VARCHAR))
+        AND month IN (LPAD(CAST(MONTH(CURRENT_DATE) AS VARCHAR), 2, '0'),
+                      LPAD(CAST(MONTH(date_add('day', -6, CURRENT_DATE)) AS VARCHAR), 2, '0'))
         -- Fine date boundary (runs post-partition-filter):
         AND date_parse(
-                CAST(year AS VARCHAR) || '-' ||
-                LPAD(CAST(month AS VARCHAR), 2, '0') || '-' ||
-                LPAD(CAST(day AS VARCHAR), 2, '0'),
+                year || '-' || month || '-' || LPAD(day, 2, '0'),
                 '%Y-%m-%d'
             ) BETWEEN date_add('day', -6, CURRENT_DATE) AND CURRENT_DATE
 ),
